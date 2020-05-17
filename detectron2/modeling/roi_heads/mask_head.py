@@ -3,7 +3,10 @@ import fvcore.nn.weight_init as weight_init
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import numpy as np
+import cv2
 from detectron2.layers import Conv2d, ConvTranspose2d, ShapeSpec, cat, get_norm
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.registry import Registry
@@ -17,23 +20,30 @@ The registered object will be called with `obj(cfg, input_shape)`.
 """
 
 
-def mask_rcnn_loss(pred_mask_logits, instances):
-    """
-    Compute the mask prediction loss defined in the Mask R-CNN paper.
+def crop_resize(a, box_proposal, box_gt, m_len, gt, image):
+    idxs = torch.arange(1,gt.gt_boxes.tensor.shape[0]+1)
+    a = a.squeeze()
+    masks = []
+    for i, b in enumerate(box_proposal):
+        x, y = b[:2].cpu().numpy()
+        w, h = b[2:].cpu().numpy()
+        x0 = int(np.floor(x))
+        y0 = int(np.floor(y))
+        x1 = int(np.ceil(w)) 
+        y1 = int(np.ceil(h))
 
-    Args:
-        pred_mask_logits (Tensor): A tensor of shape (B, C, Hmask, Wmask) or (B, 1, Hmask, Wmask)
-            for class-specific or class-agnostic, where B is the total number of predicted masks
-            in all images, C is the number of foreground classes, and Hmask, Wmask are the height
-            and width of the mask predictions. The values are logits.
-        instances (list[Instances]): A list of N Instances, where N is the number of images
-            in the batch. These instances are in 1:1
-            correspondence with the pred_mask_logits. The ground-truth labels (class, box, mask,
-            ...) associated with each instance are stored in fields.
+        mask = a[y0:y1, x0:x1]
+        
+        gt_b = box_gt[i] 
+        idx = (gt.gt_boxes.tensor==gt_b).all(dim=1)
+        mask = (mask==int(idxs[idx])).unsqueeze(0).unsqueeze(0).float()
+        mask = F.interpolate(mask,(28,28),mode='bilinear')
+        mask = mask>=0.5
+        masks.append(mask.squeeze())
+    return torch.stack(masks)
 
-    Returns:
-        mask_loss (Tensor): A scalar tensor containing the loss.
-    """
+
+def mask_rcnn_loss(pred_mask_logits, instances, aa=None, gts=None, images=None):
     cls_agnostic_mask = pred_mask_logits.size(1) == 1
     total_num_masks = pred_mask_logits.size(0)
     mask_side_len = pred_mask_logits.size(2)
@@ -41,18 +51,30 @@ def mask_rcnn_loss(pred_mask_logits, instances):
 
     gt_classes = []
     gt_masks = []
-    for instances_per_image in instances:
-        if len(instances_per_image) == 0:
-            continue
-        if not cls_agnostic_mask:
-            gt_classes_per_image = instances_per_image.gt_classes.to(dtype=torch.int64)
-            gt_classes.append(gt_classes_per_image)
+    if aa is not None:
+        for instances_per_image, a, gt, image in zip(instances, aa.tensor, gts, images):
+            if len(instances_per_image) == 0:
+                continue
+            if not cls_agnostic_mask:
+                gt_classes_per_image = instances_per_image.gt_classes.to(dtype=torch.int64)
+                gt_classes.append(gt_classes_per_image)
+            gt_masks_per_image = crop_resize(a, instances_per_image.proposal_boxes.tensor,instances_per_image.gt_boxes.tensor, mask_side_len,gt,image).to(
+                device=pred_mask_logits.device)
+            # A tensor of shape (N, M, M), N=#instances in the image; M=mask_side_len
+            gt_masks.append(gt_masks_per_image)
+    else:
+        for instances_per_image in instances:
+            if len(instances_per_image) == 0:
+                continue
+            if not cls_agnostic_mask:
+                gt_classes_per_image = instances_per_image.gt_classes.to(dtype=torch.int64)
+                gt_classes.append(gt_classes_per_image)
 
-        gt_masks_per_image = instances_per_image.gt_masks.crop_and_resize(
-            instances_per_image.proposal_boxes.tensor, mask_side_len
-        ).to(device=pred_mask_logits.device)
-        # A tensor of shape (N, M, M), N=#instances in the image; M=mask_side_len
-        gt_masks.append(gt_masks_per_image)
+            gt_masks_per_image = instances_per_image.gt_masks.crop_and_resize(
+                instances_per_image.proposal_boxes.tensor, mask_side_len
+            ).to(device=pred_mask_logits.device)
+            # A tensor of shape (N, M, M), N=#instances in the image; M=mask_side_len
+            gt_masks.append(gt_masks_per_image)
 
     if len(gt_masks) == 0:
         return pred_mask_logits.sum() * 0
@@ -92,7 +114,7 @@ def mask_rcnn_loss(pred_mask_logits, instances):
     return mask_loss
 
 
-def mask_rcnn_inference(pred_mask_logits, pred_instances):
+def mask_rcnn_inference(pred_mask_logits, pred_instances, instances, aa, gt):
     """
     Convert pred_mask_logits to estimated foreground probability masks while also
     extracting only the masks for the predicted classes in pred_instances. For each
@@ -128,7 +150,7 @@ def mask_rcnn_inference(pred_mask_logits, pred_instances):
 
     num_boxes_per_image = [len(i) for i in pred_instances]
     mask_probs_pred = mask_probs_pred.split(num_boxes_per_image, dim=0)
-
+    
     for prob, instances in zip(mask_probs_pred, pred_instances):
         instances.pred_masks = prob  # (1, Hmask, Wmask)
 
@@ -149,11 +171,11 @@ class MaskRCNNConvUpsampleHead(nn.Module):
         super(MaskRCNNConvUpsampleHead, self).__init__()
 
         # fmt: off
-        num_classes       = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        conv_dims         = cfg.MODEL.ROI_MASK_HEAD.CONV_DIM
-        self.norm         = cfg.MODEL.ROI_MASK_HEAD.NORM
-        num_conv          = cfg.MODEL.ROI_MASK_HEAD.NUM_CONV
-        input_channels    = input_shape.channels
+        num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        conv_dims = cfg.MODEL.ROI_MASK_HEAD.CONV_DIM
+        self.norm = cfg.MODEL.ROI_MASK_HEAD.NORM
+        num_conv = cfg.MODEL.ROI_MASK_HEAD.NUM_CONV
+        input_channels = input_shape.channels
         cls_agnostic_mask = cfg.MODEL.ROI_MASK_HEAD.CLS_AGNOSTIC_MASK
         # fmt: on
 
