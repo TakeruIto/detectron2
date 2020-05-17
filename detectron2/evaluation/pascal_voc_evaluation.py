@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict, defaultdict
 from functools import lru_cache
 import torch
+from chainercv.evaluations import eval_instance_segmentation_coco, eval_instance_segmentation_voc
 
 from detectron2.data import MetadataCatalog
 from detectron2.utils import comm
@@ -34,7 +35,7 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         self._dataset_name = dataset_name
         meta = MetadataCatalog.get(dataset_name)
         self._anno_file_template = os.path.join(meta.dirname, "Annotations", "{}.xml")
-        self._image_set_path = os.path.join(meta.dirname, "ImageSets", "Main", meta.split + ".txt")
+        self._image_set_path = os.path.join(meta.dirname, "ImageSets", "Segmentation", meta.split + ".txt")
         self._class_names = meta.thing_classes
         assert meta.year in [2007, 2012], meta.year
         self._is_2007 = meta.year == 2007
@@ -43,6 +44,7 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
 
     def reset(self):
         self._predictions = defaultdict(list)  # class name -> list of prediction strings
+        self._mask_preds = {}
 
     def process(self, inputs, outputs):
         for input, output in zip(inputs, outputs):
@@ -51,6 +53,12 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
             boxes = instances.pred_boxes.tensor.numpy()
             scores = instances.scores.tolist()
             classes = instances.pred_classes.tolist()
+
+            masks = instances.pred_masks.numpy()
+            gt_masks = self._make_gt_masks(input["segment_annotation"])
+            gt_labels = self._make_gt_labels(input["annotations"])
+            if gt_masks.shape[0]==gt_labels.shape[0]:
+                self._mask_preds[image_id] = {"pred_masks":masks,"pred_labels":classes,"pred_scores":np.array(scores),"gt_masks":gt_masks,"gt_labels":np.array(gt_labels)}
             for box, score, cls in zip(boxes, scores, classes):
                 xmin, ymin, xmax, ymax = box
                 # The inverse of data loading logic in `datasets/pascal_voc.py`
@@ -59,6 +67,22 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
                 self._predictions[cls].append(
                     f"{image_id} {score:.3f} {xmin:.1f} {ymin:.1f} {xmax:.1f} {ymax:.1f}"
                 )
+
+    def _make_gt_masks(self,segment_ann):
+        label_uniq = torch.unique(segment_ann)
+        result = []
+        for label in label_uniq:
+            if label==0:
+                continue
+            mask = (segment_ann==label).numpy()
+            result.append(mask)
+        return np.array(result)
+
+    def _make_gt_labels(self,ann):
+        result = []
+        for an in ann:
+            result.append(an["category_id"])
+        return np.array(result)
 
     def evaluate(self):
         """
@@ -106,6 +130,28 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         mAP = {iou: np.mean(x) for iou, x in aps.items()}
         ret["bbox"] = {"AP": np.mean(list(mAP.values())), "AP50": mAP[50], "AP75": mAP[75]}
         return ret
+
+
+    def my_evaluate(self):
+
+        self._logger.info(
+            "Evaluating {} using {} metric. ".format(
+                self._dataset_name, "coco"
+            )
+        )
+        pred_masks = [self._mask_preds[i]["pred_masks"] for i in self._mask_preds]
+        pred_labels = [self._mask_preds[i]["pred_labels"] for i in self._mask_preds]
+        pred_scores = [self._mask_preds[i]["pred_scores"] for i in self._mask_preds]
+        gt_masks = [self._mask_preds[i]["gt_masks"] for i in self._mask_preds]
+        gt_labels = [self._mask_preds[i]["gt_labels"] for i in self._mask_preds]
+        result = eval_instance_segmentation_coco(pred_masks, pred_labels, pred_scores, gt_masks, gt_labels)
+        result2 = eval_instance_segmentation_voc(pred_masks, pred_labels, pred_scores, gt_masks, gt_labels, iou_thresh=0.75)
+        ret = OrderedDict()
+        print(result)
+        ret["instance_segmentation"] = {"mAP": np.mean(result['ap/iou=0.50:0.95/area=all/max_dets=100']), "AP50":np.mean(result['ap/iou=0.50/area=all/max_dets=100']),"AP75":np.mean(result['ap/iou=0.75/area=all/max_dets=100'])}
+        return ret
+
+
 
 
 ##############################################################################
