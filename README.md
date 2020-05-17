@@ -13,3 +13,6 @@ python tools/train_net.py --config-file configs/PascalVOC-Detection/faster_rcnn_
 ※I'm sorry but results are not good for now (AP: 33%)!!
 
 ## result example
+
+![c](https://user-images.githubusercontent.com/39827302/82139181-0c125880-9861-11ea-9e41-99c2c0473248.png)
+![b](https://user-images.githubusercontent.com/39827302/82139185-22b8af80-9861-11ea-9dc7-5f3c48f74c9b.png)
