@@ -8,7 +8,7 @@ This is an test implementation for PASCAL VOC instance segmentation
 
 for example
 ```
-python tools/train_net.py --config-file configs/PascalVOC-Detection/faster_rcnn_R_50_FPN.yaml  
+python tools/train_net.py --config-file configs/PascalVOC-Detection/faster_rcnn_R_50_FPN.yaml --num-gpus 1 SOLVER.IMS_PER_BATCH 2
 ```
 ※I'm sorry but results are not good for now (AP: 33%)!!
 
