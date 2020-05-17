@@ -4,6 +4,7 @@ import copy
 import itertools
 import logging
 import numpy as np
+import operator
 import pickle
 import torch.utils.data
 from fvcore.common.file_io import PathManager
@@ -17,7 +18,7 @@ from detectron2.utils.logger import log_first_n
 
 from . import samplers
 from .catalog import DatasetCatalog, MetadataCatalog
-from .common import DatasetFromList, MapDataset
+from .common import AspectRatioGroupedDataset, DatasetFromList, MapDataset
 from .dataset_mapper import DatasetMapper
 from .detection_utils import check_metadata_consistency
 
@@ -103,6 +104,13 @@ def load_proposals_into_dataset(dataset_dicts, proposal_file):
     """
     Load precomputed object proposals into the dataset.
 
+    The proposal file should be a pickled dict with the following keys:
+    - "ids": list[int] or list[str], the image ids
+    - "boxes": list[np.ndarray], each is an Nx4 array of boxes corresponding to the image id
+    - "objectness_logits": list[np.ndarray], each is an N sized array of objectness scores
+        corresponding to the boxes.
+    - "bbox_mode": the BoxMode of the boxes array. Defaults to ``BoxMode.XYXY_ABS``.
+
     Args:
         dataset_dicts (list[dict]): annotations in Detectron2 Dataset format.
         proposal_file (str): file path of pre-computed proposals, in pkl format.
@@ -122,19 +130,17 @@ def load_proposals_into_dataset(dataset_dicts, proposal_file):
         if key in proposals:
             proposals[rename_keys[key]] = proposals.pop(key)
 
-    # Remove proposals whose ids are not in dataset
-    img_ids = set({entry["image_id"] for entry in dataset_dicts})
-    keep = [i for i, id in enumerate(proposals["ids"]) if id in img_ids]
-    # Sort proposals by ids following the image order in dataset
-    keep = sorted(keep)
-    for key in ["boxes", "ids", "objectness_logits"]:
-        proposals[key] = [proposals[key][i] for i in keep]
+    # Fetch the indexes of all proposals that are in the dataset
+    # Convert image_id to str since they could be int.
+    img_ids = set({str(record["image_id"]) for record in dataset_dicts})
+    id_to_index = {str(id): i for i, id in enumerate(proposals["ids"]) if str(id) in img_ids}
+
     # Assuming default bbox_mode of precomputed proposals are 'XYXY_ABS'
     bbox_mode = BoxMode(proposals["bbox_mode"]) if "bbox_mode" in proposals else BoxMode.XYXY_ABS
 
-    for i, record in enumerate(dataset_dicts):
-        # Sanity check that these proposals are for the correct image id
-        assert record["image_id"] == proposals["ids"][i]
+    for record in dataset_dicts:
+        # Get the index of the proposal
+        i = id_to_index[str(record["image_id"])]
 
         boxes = proposals["boxes"][i]
         objectness_logits = proposals["objectness_logits"][i]
@@ -143,7 +149,6 @@ def load_proposals_into_dataset(dataset_dicts, proposal_file):
         record["proposal_boxes"] = boxes[inds]
         record["proposal_objectness_logits"] = objectness_logits[inds]
         record["proposal_bbox_mode"] = bbox_mode
-
     return dataset_dicts
 
 
@@ -193,49 +198,10 @@ def print_instances_class_histogram(dataset_dicts, class_names):
     )
     log_first_n(
         logging.INFO,
-        "Distribution of training instances among all {} categories:\n".format(num_classes)
-        + colored(table, "cyan"),
+        "Distribution of instances among all {} categories:\n".format(num_classes) +
+        colored(table, "cyan"),
         key="message",
     )
-
-
-def build_batch_data_sampler(
-    sampler, images_per_batch, group_bin_edges=None, grouping_features=None
-):
-    """
-    Return a dataset index sampler that batches dataset indices possibly with
-    grouping to improve training efficiency.
-
-    Args:
-        sampler (torch.utils.data.sampler.Sampler): any subclass of
-            :class:`torch.utils.data.sampler.Sampler`.
-        images_per_batch (int): the batch size. Note that the sampler may return
-            batches that have between 1 and images_per_batch (inclusive) elements
-            because the underlying index set (and grouping partitions, if grouping
-            is used) may not be divisible by images_per_batch.
-        group_bin_edges (None, list[number], tuple[number]): If None, then grouping
-            is disabled. If a list or tuple is given, the values are used as bin
-            edges for defining len(group_bin_edges) + 1 groups. When batches are
-            sampled, only elements from the same group are returned together.
-        grouping_features (None, list[number], tuple[number]): If None, then grouping
-            is disabled. If a list or tuple is given, it must specify for each index
-            in the underlying dataset the value to be used for placing that dataset
-            index into one of the grouping bins.
-
-    Returns:
-        A BatchSampler or subclass of BatchSampler.
-    """
-    if group_bin_edges and grouping_features:
-        assert isinstance(group_bin_edges, (list, tuple))
-        assert isinstance(grouping_features, (list, tuple))
-        group_ids = _quantize(grouping_features, group_bin_edges)
-        batch_sampler = samplers.GroupedBatchSampler(sampler, group_ids, images_per_batch)
-    else:
-        batch_sampler = torch.utils.data.sampler.BatchSampler(
-            sampler, images_per_batch, drop_last=True
-        )  # drop last so the batch always have the same size
-        # NOTE when we add batch inference support, make sure not to use this.
-    return batch_sampler
 
 
 def get_detection_dataset_dicts(
@@ -256,7 +222,6 @@ def get_detection_dataset_dicts(
     dataset_dicts = [DatasetCatalog.get(dataset_name) for dataset_name in dataset_names]
     for dataset_name, dicts in zip(dataset_names, dataset_dicts):
         assert len(dicts), "Dataset '{}' is empty!".format(dataset_name)
-
     if proposal_files is not None:
         assert len(dataset_names) == len(proposal_files)
         # load precomputed proposals from proposal files
@@ -266,7 +231,6 @@ def get_detection_dataset_dicts(
         ]
 
     dataset_dicts = list(itertools.chain.from_iterable(dataset_dicts))
-
     has_instances = "annotations" in dataset_dicts[0]
     # Keep images without instance-level GT if the dataset has semantic labels.
     if filter_empty and has_instances and "sem_seg_file_name" not in dataset_dicts[0]:
@@ -302,7 +266,7 @@ def build_detection_train_loader(cfg, mapper=None):
             By default it will be `DatasetMapper(cfg, True)`.
 
     Returns:
-        a torch DataLoader object
+        an infinite iterator of training data
     """
     num_workers = get_world_size()
     images_per_batch = cfg.SOLVER.IMS_PER_BATCH
@@ -327,16 +291,9 @@ def build_detection_train_loader(cfg, mapper=None):
         proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
     )
     dataset = DatasetFromList(dataset_dicts, copy=False)
-
-    # Bin edges for batching images with similar aspect ratios. If ASPECT_RATIO_GROUPING
-    # is enabled, we define two bins with an edge at height / width = 1.
-    group_bin_edges = [1] if cfg.DATALOADER.ASPECT_RATIO_GROUPING else []
-    aspect_ratios = [float(img["height"]) / float(img["width"]) for img in dataset]
-
     if mapper is None:
         mapper = DatasetMapper(cfg, True)
     dataset = MapDataset(dataset, mapper)
-
     sampler_name = cfg.DATALOADER.SAMPLER_TRAIN
     logger = logging.getLogger(__name__)
     logger.info("Using training sampler {}".format(sampler_name))
@@ -348,17 +305,30 @@ def build_detection_train_loader(cfg, mapper=None):
         )
     else:
         raise ValueError("Unknown training sampler: {}".format(sampler_name))
-    batch_sampler = build_batch_data_sampler(
-        sampler, images_per_worker, group_bin_edges, aspect_ratios
-    )
 
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.DATALOADER.NUM_WORKERS,
-        batch_sampler=batch_sampler,
-        collate_fn=trivial_batch_collator,
-        worker_init_fn=worker_init_reset_seed,
-    )
+    if cfg.DATALOADER.ASPECT_RATIO_GROUPING:
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            num_workers=cfg.DATALOADER.NUM_WORKERS,
+            batch_sampler=None,
+            collate_fn=operator.itemgetter(0),  # don't batch, but yield individual elements
+            worker_init_fn=worker_init_reset_seed,
+        )  # yield individual mapped dict
+        data_loader = AspectRatioGroupedDataset(data_loader, images_per_worker)
+    else:
+        batch_sampler = torch.utils.data.sampler.BatchSampler(
+            sampler, images_per_worker, drop_last=True
+        )
+        # drop_last so the batch always have the same size
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.DATALOADER.NUM_WORKERS,
+            batch_sampler=batch_sampler,
+            collate_fn=trivial_batch_collator,
+            worker_init_fn=worker_init_reset_seed,
+        )
+
     return data_loader
 
 

@@ -37,8 +37,8 @@ def _do_paste_mask(masks, boxes, img_h, img_w, skip_empty=True):
         x0_int, y0_int = torch.clamp(boxes.min(dim=0).values.floor()[:2] - 1, min=0).to(
             dtype=torch.int32
         )
-        x1_int = torch.clamp(boxes[:, 2].max().ceil() + 1, max=img_w).to(dtype=torch.int32)
-        y1_int = torch.clamp(boxes[:, 3].max().ceil() + 1, max=img_h).to(dtype=torch.int32)
+        x1_int = torch.clamp(boxes[:, 2].max().ceil()+1 , max=img_w).to(dtype=torch.int32)
+        y1_int = torch.clamp(boxes[:, 3].max().ceil()+1 , max=img_h).to(dtype=torch.int32)
     else:
         x0_int, y0_int = 0, 0
         x1_int, y1_int = img_w, img_h

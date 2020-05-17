@@ -187,7 +187,7 @@ class ResizeShortestEdge(TransformGen):
             short_edge_length = (short_edge_length, short_edge_length)
         self._init(locals())
 
-    def get_transform(self, img):
+    def get_transform(self, img, seg=False):
         h, w = img.shape[:2]
 
         if self.is_range:
@@ -208,7 +208,10 @@ class ResizeShortestEdge(TransformGen):
             neww = neww * scale
         neww = int(neww + 0.5)
         newh = int(newh + 0.5)
-        return ResizeTransform(h, w, newh, neww, self.interp)
+        if seg:
+            return ResizeTransform(h, w, newh, neww, self.interp), ResizeTransform(h, w, newh, neww, Image.NEAREST)
+        else:
+            return ResizeTransform(h, w, newh, neww, self.interp)
 
 
 class RandomCrop(TransformGen):
@@ -411,7 +414,7 @@ class RandomLighting(TransformGen):
         )
 
 
-def apply_transform_gens(transform_gens, img):
+def apply_transform_gens(transform_gens, img, seg=None):
     """
     Apply a list of :class:`TransformGen` on the input image, and
     returns the transformed image and a list of transforms.
@@ -436,10 +439,17 @@ def apply_transform_gens(transform_gens, img):
 
     tfms = []
     for g in transform_gens:
-        tfm = g.get_transform(img)
-        assert isinstance(
-            tfm, Transform
-        ), "TransformGen {} must return an instance of Transform! Got {} instead".format(g, tfm)
-        img = tfm.apply_image(img)
-        tfms.append(tfm)
-    return img, TransformList(tfms)
+        if isinstance(g, ResizeShortestEdge):
+            tfm, tfm2 = g.get_transform(img,True)
+            img = tfm.apply_image(img)
+            seg = tfm2.apply_image(seg)
+            tfms.append(tfm)
+        else:
+            tfm = g.get_transform(img)
+            assert isinstance(
+                tfm, Transform
+            ), "TransformGen {} must return an instance of Transform! Got {} instead".format(g, tfm)
+            img = tfm.apply_image(img)
+            seg = tfm.apply_image(seg)
+            tfms.append(tfm)
+    return img, seg, TransformList(tfms)
